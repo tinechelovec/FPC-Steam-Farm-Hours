@@ -14,7 +14,7 @@ try:
 except Exception:
     tg_types = None
 NAME = 'Steam Farm Hours'
-VERSION = '1.1.0'
+VERSION = '1.1.1'
 DESCRIPTION = 'Автоматическая продажа фарма часов Steam'
 CREDITS = '@dmitry_mak09, @tinechelovec'
 UUID = 'ad850697-49bd-481d-8660-2c06f16b5813'
@@ -47,6 +47,7 @@ LOCAL_PACKAGE_FILE = os.path.join(LOCAL_DIR, 'package.json')
 LOCAL_META_FILE = os.path.join(LOCAL_DIR, 'meta.json')
 LOCAL_DAEMON_LOG = os.path.join(LOG_DIR, 'local-daemon.log')
 LOCAL_RUNTIME_DIR = os.path.join(LOCAL_DIR, 'runtime')
+LOCAL_NPM_CACHE_DIR = os.path.join(LOCAL_DIR, 'npm-cache')
 LOCAL_NODE_DIST = 'https://nodejs.org/dist'
 LOCAL_DEFAULT_PORT = 28745
 LOCAL_STEAM_USER_VERSION = '^5.2.0'
@@ -83,12 +84,14 @@ _config_lock = threading.RLock()
 _state_lock = threading.RLock()
 _snapshot_lock = threading.RLock()
 _update_lock = threading.Lock()
+_order_capacity_lock = threading.RLock()
 _stop_event = threading.Event()
 _snapshot_cache = {'ts': 0.0, 'sub': None, 'accounts': None}
 def _ensure_dirs():
     Path(STORAGE_DIR).mkdir(parents=True, exist_ok=True)
     Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
     Path(LOCAL_DIR).mkdir(parents=True, exist_ok=True)
+    Path(LOCAL_NPM_CACHE_DIR).mkdir(parents=True, exist_ok=True)
 def _atomic_json(path, payload):
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -166,33 +169,194 @@ def cfg_set(key, value):
     elif key in {'farm_backend', 'local_max_accounts', 'local_max_games', 'local_port'}:
         _local_client = None
         _invalidate_snapshot()
+LOG_TAG = '[Steam Farm Hours]'
+HUMAN_LOGS = str(os.getenv('STEAMFARM_HUMAN_LOGS', '1')).strip().lower() not in {'0', 'false', 'off', 'no'}
+LOG_COLORS = str(os.getenv('STEAMFARM_COLOR_LOGS', '1')).strip().lower() not in {'0', 'false', 'off', 'no'}
+
+class _Ansi:
+    RED = '\x1b[31m'
+    YELLOW = '\x1b[33m'
+    CYAN = '\x1b[36m'
+    GREEN = '\x1b[32m'
+    DIM = '\x1b[90m'
+    BOLD = '\x1b[1m'
+    RESET = '\x1b[0m'
+
+def _log_value(key, value, limit=260):
+    name = str(key or '').lower()
+    if any(token in name for token in ('api_key', 'password', 'guard', 'token', 'secret', 'authorization', 'code')):
+        return '***'
+    try:
+        text = str(value)
+    except Exception:
+        text = repr(value)
+    return text.replace('\r', ' ').replace('\n', ' ').strip()[:max(1, int(limit))]
+
+def _safe_log_fields(fields):
+    return {str(k)[:60]: _log_value(k, v) for k, v in dict(fields or {}).items() if v is not None}
+
+def _structured_event_text(event, fields):
+    safe = _safe_log_fields(fields)
+    parts = [f'event={str(event or "event").replace(chr(10), " ")[:80]}']
+    parts.extend(f'{key}={value}' for key, value in safe.items())
+    return ' '.join(parts)
+
+def _human_event_message(event, fields):
+    e = str(event or 'event')
+    f = _safe_log_fields(fields)
+    def get(name, default='—'):
+        value = f.get(name)
+        return value if value not in (None, '') else default
+    if e == 'logging_ready':
+        return f'Логирование готово. Файл: {get("path")}'
+    if e == 'initialized':
+        return f'Плагин запущен · версия {get("version")} · лотов: {get("lots", "0")} · заказов в состоянии: {get("services", "0")}'
+    if e == 'deleted':
+        return f'Плагин остановлен · версия {get("version")}'
+    if e == 'backend_switched':
+        backend = get('backend', '?').lower()
+        label = 'Local (бесплатно)' if backend == 'local' else 'API dim4n4ik' if backend == 'api' else backend
+        return f'Движок переключён: {label}'
+    if e == 'farm_order_received':
+        queue = ' · поставлен в очередь' if get('queued', 'False').lower() in {'true', '1', 'yes'} else ''
+        return f'Новый заказ #{get("order_id")} · лот {get("lot_id")} · x{get("quantity", "1")} · {get("hours", "?")} ч. · покупатель {get("buyer")}{queue}'
+    if e == 'order_lot_match':
+        source = {'id': 'по ID', 'exact_title': 'по точному названию'}.get(get('source', ''), get('source', ''))
+        return f'Заказ #{get("order_id")} сопоставлен с лотом {get("lot_id")} · {source}'
+    if e == 'binding_miss':
+        return f'Для заказа #{get("order_id")} не найдена подходящая привязка лота'
+    if e == 'capacity_slot_check':
+        return f'Проверка свободных мест · {get("details")}'
+    if e == 'api_request':
+        return f'API {get("method")} {get("path")} → HTTP {get("status")} · {get("ms", "?")} мс · попытка {get("attempt", "1")}'
+    if e == 'api_network_error':
+        return f'Сетевая ошибка API {get("method")} {get("path")} · попытка {get("attempt", "1")} · {get("error")}'
+    if e == 'refund_success':
+        return f'Возврат по заказу #{get("order_id")} выполнен'
+    if e == 'refund_error':
+        return f'Не удалось вернуть деньги по заказу #{get("order_id")} · {get("error")}'
+    if e == 'funpay_refund_stop':
+        return f'Заказ #{get("order_id")} остановлен после изменения FunPay · статус {get("status")} · завершён: {get("finalized")}'
+    if e == 'service_stop_retry':
+        return f'Повтор остановки заказа #{get("order_id")} · попытка {get("attempt")} · {get("error")}'
+    if e == 'funpay_send_error':
+        return f'Ошибка отправки сообщения в FunPay · попытка {get("attempt")} · {get("error")}'
+    if e == 'funpay_lot_save_retry':
+        return f'Не удалось сохранить лот {get("lot_id")} · попытка {get("attempt")} · {get("error")}'
+    if e == 'lot_capacity_sync_error':
+        return f'Ошибка синхронизации доступности лота {get("lot_id")} · {get("error")}'
+    if e == 'order_match_lookup_error':
+        return f'Ошибка поиска лота для заказа #{get("order_id")} · {get("error")}'
+    if e == 'background_error':
+        return f'Ошибка фоновой проверки · {get("error")}'
+    if e == 'telegram_send_error':
+        return f'Ошибка отправки сообщения в Telegram · {get("error")}'
+    if e == 'send_document_error':
+        return f'Ошибка отправки файла в Telegram · {get("error")}'
+    if e == 'telegram_callback_error':
+        return f'Ошибка Telegram-кнопки {get("action")} · {get("error")}'
+    if e == 'telegram_text_handler_error':
+        return f'Не удалось зарегистрировать обработчик текста Telegram · {get("error")}'
+    if e == 'telegram_document_handler_error':
+        return f'Не удалось зарегистрировать обработчик файлов Telegram · {get("error")}'
+    if e == 'telegram_command_handler_error':
+        return f'Не удалось зарегистрировать команду Telegram · {get("error")}'
+    if e == 'telegram_callback_handler_error':
+        return f'Не удалось зарегистрировать обработчик кнопок Telegram · {get("error")}'
+    if e == 'plugin_entry_handler_error':
+        return f'Не удалось зарегистрировать вход в меню плагина · {get("error")}'
+    if e == 'add_command_error':
+        return f'Не удалось добавить /steamfarm в список команд · {get("error")}'
+    if e == 'update_checked':
+        ok = get('ok', 'False').lower() in {'true', '1', 'yes'}
+        return f'Проверка обновления ({get("source")}) · {"успешно" if ok else "ошибка"}'
+    if e == 'local':
+        return f'Local · {get("message", "")}'.rstrip()
+    details = ' · '.join(f'{key}: {value}' for key, value in f.items())
+    return f'{e.replace("_", " ")}' + (f' · {details}' if details else '')
+
+class _HumanLogFormatter(logging.Formatter):
+    def format(self, record):
+        event = getattr(record, 'steamfarm_event', '')
+        fields = getattr(record, 'steamfarm_fields', {})
+        if event:
+            text = _human_event_message(event, fields)
+        else:
+            text = record.getMessage() or ''
+            if text.startswith(LP):
+                text = text[len(LP):].strip()
+        timestamp = time.strftime('%d-%m-%Y %H:%M:%S', time.localtime(record.created))
+        letter = {logging.DEBUG: 'D', logging.INFO: 'I', logging.WARNING: 'W', logging.ERROR: 'E', logging.CRITICAL: 'C'}.get(record.levelno, 'I')
+        if not LOG_COLORS:
+            return f'[{timestamp}]> {letter}: {LOG_TAG} {text}'
+        color = _Ansi.CYAN
+        if record.levelno >= logging.ERROR:
+            color = _Ansi.RED
+        elif record.levelno == logging.WARNING:
+            color = _Ansi.YELLOW
+        elif record.levelno == logging.DEBUG:
+            color = _Ansi.DIM
+        elif event in {'initialized', 'refund_success'}:
+            color = _Ansi.GREEN
+        return f'{color}[{timestamp}]> {_Ansi.BOLD}{letter}{_Ansi.RESET}{color}: {LOG_TAG} {text}{_Ansi.RESET}'
+
 def _configure_logging():
     try:
         _ensure_dirs()
         target = os.path.normcase(str(Path(LOG_FILE).resolve()))
-        for h in logger.handlers:
-            if isinstance(h, logging.FileHandler) and os.path.normcase(str(Path(getattr(h, 'baseFilename', '')).resolve())) == target:
-                return
-        h = logging.FileHandler(LOG_FILE, encoding='utf-8')
-        h.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
-        logger.addHandler(h)
-    except Exception:
-        pass
-def _close_logging():
-    for h in list(logger.handlers):
-        if isinstance(h, logging.FileHandler):
+        for handler in list(logger.handlers):
+            same_file = isinstance(handler, logging.FileHandler) and os.path.normcase(str(Path(getattr(handler, 'baseFilename', '') or '').resolve())) == target
+            ours = bool(getattr(handler, '_steamfarm_handler', False))
+            if not (same_file or ours):
+                continue
             try:
-                h.flush()
-                logger.removeHandler(h)
-                h.close()
+                handler.flush()
             except Exception:
                 pass
+            try:
+                logger.removeHandler(handler)
+                handler.close()
+            except Exception:
+                pass
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        if HUMAN_LOGS:
+            console = logging.StreamHandler()
+            console._steamfarm_handler = True
+            console._steamfarm_console = True
+            console.setFormatter(_HumanLogFormatter())
+            logger.addHandler(console)
+        file_handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
+        file_handler._steamfarm_handler = True
+        file_handler._steamfarm_file = True
+        file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+        logger.addHandler(file_handler)
+        _log_event('logging_ready', path=target)
+    except Exception as e:
+        try:
+            logger.propagate = True
+            logger.warning(f'{LP} file logging disabled: {e}')
+        except Exception:
+            pass
+
+def _close_logging():
+    for handler in list(logger.handlers):
+        if not bool(getattr(handler, '_steamfarm_handler', False)):
+            continue
+        try:
+            handler.flush()
+        except Exception:
+            pass
+        try:
+            logger.removeHandler(handler)
+            handler.close()
+        except Exception:
+            pass
+
 def _log_event(event, level=logging.INFO, **fields):
-    parts = [f'event={str(event)[:80]}']
-    for k, v in fields.items():
-        text = '***' if any((w in str(k).lower() for w in ('key', 'password', 'guard', 'token', 'code'))) else str(v).replace('\r', ' ').replace('\n', ' ')[:260]
-        parts.append(f'{str(k)[:60]}={text}')
-    logger.log(level, f'{LP} ' + ' '.join(parts))
+    safe = _safe_log_fields(fields)
+    raw = _structured_event_text(event, safe)
+    logger.log(level, f'{LP} {raw}', extra={'steamfarm_event': str(event or 'event'), 'steamfarm_fields': safe})
 class FarmApiError(Exception):
     def __init__(self, http, code, message, extra=None):
         super().__init__(f'{code}: {message}')
@@ -519,10 +683,7 @@ def _local_console(text):
     line = str(text or '').replace('\r', '').strip()
     if not line:
         return
-    try:
-        print(f'[steamfarm-local] {line}', flush=True)
-    except Exception:
-        pass
+    _log_event('local', message=line)
 def _find_bundled_node(runtime_dir=None):
     root = Path(runtime_dir or LOCAL_RUNTIME_DIR)
     candidates = [root / 'node.exe', root / 'bin' / 'node']
@@ -663,7 +824,7 @@ def _ensure_local_node_runtime():
         roots = [x for x in unpacked.iterdir() if x.is_dir()]
         source = roots[0] if len(roots) == 1 else unpacked
         replacement = temp / 'runtime-new'
-        shutil.copytree(source, replacement)
+        shutil.copytree(source, replacement, symlinks=True)
         if runtime.exists():
             shutil.rmtree(runtime, ignore_errors=True)
         shutil.move(str(replacement), str(runtime))
@@ -700,9 +861,60 @@ def _local_npm_install_command(npm):
         str(npm), 'install', '--omit=dev', '--no-audit', '--no-fund',
         '--loglevel=http', '--fetch-retries=4',
         '--fetch-retry-mintimeout=2000', '--fetch-retry-maxtimeout=20000',
+        '--cache', LOCAL_NPM_CACHE_DIR,
     ]
 def _local_node_version():
     return _node_version_for_path(_local_node_path())
+def _is_bundled_node_path(node):
+    if not node:
+        return False
+    try:
+        Path(node).resolve().relative_to(Path(LOCAL_RUNTIME_DIR).resolve())
+        return True
+    except Exception:
+        return False
+def _remove_local_node_runtime():
+    _stop_local_daemon()
+    runtime = Path(LOCAL_RUNTIME_DIR)
+    removed = runtime.exists()
+    if removed:
+        try:
+            shutil.rmtree(runtime)
+        except Exception as e:
+            raise LocalFarmError('cleanup_failed', f'Не удалось удалить portable Node.js: {e}') from e
+    if runtime.exists():
+        raise LocalFarmError('cleanup_failed', 'Каталог portable Node.js не удалён полностью.')
+    _invalidate_snapshot()
+    _local_console('Portable Node.js удалён.' if removed else 'Portable Node.js плагина не был установлен.')
+    return {'ok': True, 'removed': removed, 'path': str(runtime)}
+def _remove_local_dependencies(remove_cache=True):
+    _stop_local_daemon()
+    targets = [Path(LOCAL_DIR) / 'node_modules', Path(LOCAL_DIR) / 'package-lock.json']
+    if remove_cache:
+        targets.append(Path(LOCAL_NPM_CACHE_DIR))
+    removed = False
+    for target in targets:
+        if not target.exists():
+            continue
+        removed = True
+        try:
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        except Exception as e:
+            raise LocalFarmError('cleanup_failed', f'Не удалось удалить {target.name}: {e}') from e
+    _invalidate_snapshot()
+    _local_console('steam-user/npm cache удалены.' if removed else 'steam-user/npm cache уже отсутствуют.')
+    return {'ok': True, 'removed': removed}
+def _reset_local_backend():
+    _stop_local_daemon()
+    deps = _remove_local_dependencies(remove_cache=True)
+    node = _remove_local_node_runtime()
+    _write_local_helper_files()
+    _invalidate_snapshot()
+    _local_console('Local backend очищен и готов к переустановке.')
+    return {'ok': True, 'dependencies_removed': bool(deps.get('removed')), 'node_removed': bool(node.get('removed'))}
 def _install_local_runtime():
     _ensure_dirs()
     _write_local_helper_files()
@@ -720,6 +932,9 @@ def _install_local_runtime():
     env = os.environ.copy()
     node_dir = str(Path(node).resolve().parent)
     env['PATH'] = node_dir + os.pathsep + str(env.get('PATH') or '')
+    env['npm_config_cache'] = LOCAL_NPM_CACHE_DIR
+    env['HOME'] = LOCAL_DIR
+    env['XDG_CACHE_HOME'] = LOCAL_NPM_CACHE_DIR
     try:
         proc = subprocess.Popen(
             cmd, cwd=LOCAL_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -905,7 +1120,7 @@ def _local_runtime_status(live=True):
             accounts = list(_local_direct_request('GET', '/sessions', timeout=3).get('data') or [])
         except Exception:
             accounts = []
-    return {'node': node, 'npm': npm, 'node_version': _local_node_version() if node else '', 'installed': installed, 'health': health, 'accounts': accounts, 'error': error}
+    return {'node': node, 'npm': npm, 'node_version': _local_node_version() if node else '', 'node_bundled': _is_bundled_node_path(node), 'installed': installed, 'health': health, 'accounts': accounts, 'error': error}
 class LocalFarmClient:
     def _request(self, method, path, body=None, timeout=60):
         if not _local_daemon_alive():
@@ -1085,7 +1300,7 @@ def _human_error(e):
             return f"{base} Не хватает: {_fmt_rub(e.extra.get('need_kop'))}."
         return base
     if isinstance(e, LocalFarmError):
-        mapping = {'node_missing': 'Node.js не найден.', 'node_platform': 'Автоустановка Node.js не поддерживает эту платформу.', 'node_download_failed': 'Не удалось автоматически установить Node.js.', 'npm_missing': 'npm не найден.', 'not_installed': 'Local backend ещё не установлен.', 'bad_code': 'Код Steam Guard не подошёл.', 'login_expired': 'Сессия входа устарела.', 'steam_login_failed': 'Steam не принял вход.', 'start_failed': 'Не удалось запустить Local helper.', 'install_failed': 'Не удалось установить Local backend.', 'install_timeout': 'Установка Local backend превысила лимит времени.'}
+        mapping = {'node_missing': 'Node.js не найден.', 'node_platform': 'Автоустановка Node.js не поддерживает эту платформу.', 'node_download_failed': 'Не удалось автоматически установить Node.js.', 'npm_missing': 'npm не найден.', 'not_installed': 'Local backend ещё не установлен.', 'bad_code': 'Код Steam Guard не подошёл.', 'login_expired': 'Сессия входа устарела.', 'steam_login_failed': 'Steam не принял вход.', 'start_failed': 'Не удалось запустить Local helper.', 'install_failed': 'Не удалось установить Local backend.', 'install_timeout': 'Установка Local backend превысила лимит времени.', 'cleanup_failed': 'Не удалось очистить Local backend.'}
         message = str(e.message or '')
         low = message.lower()
         if e.code in {'install_failed', 'install_timeout'} and any(x in low for x in ('econnreset', 'etimedout', 'eai_again', 'enotfound', 'network request', 'network connectivity')):
@@ -1412,7 +1627,7 @@ def _capacity_for_binding(binding, subscription, connected_count, now_ts=None):
     return {'ok': qty > 0, 'sellable_qty': max(0, qty), 'reason': '' if qty > 0 else 'not_enough_time', 'safe_hours': safe, 'queue_delay_hours': delay}
 def _capacity_reason_text(reason):
     return {'no_api_key': 'API-ключ не настроен.', 'no_subscription': 'Нет активной подписки на фарм.', 'bad_expiry': 'Не удалось определить срок подписки.', 'no_free_slots': 'На тарифе нет свободного места для нового Steam-аккаунта.', 'games_over_plan': 'Лимит игр этого лота превышает текущий тариф.', 'not_enough_time': 'До окончания подписки недостаточно безопасного времени.', 'api_error': 'Не удалось проверить состояние API.', 'backend_error': 'Не удалось проверить состояние выбранного движка фарма.', 'queued_fifo': 'Перед этим заказом уже есть более ранние заказы в очереди.', 'queued_no_free_slots': 'Сейчас все места заняты, заказ будет поставлен в очередь.'}.get(str(reason or ''), 'Заказ сейчас нельзя безопасно запустить.')
-def _set_funpay_lot_fields(lot_id, active=None, amount=None, attempts=3):
+def _set_funpay_lot_fields(lot_id, active=None, amount=None, attempts=5):
     if cardinal is None or getattr(cardinal, 'account', None) is None:
         return False
     for attempt in range(1, max(1, int(attempts)) + 1):
@@ -1443,23 +1658,25 @@ def _set_funpay_lot_fields(lot_id, active=None, amount=None, attempts=3):
         except Exception as e:
             _log_event('funpay_lot_save_retry', level=logging.WARNING, lot_id=lot_id, attempt=attempt, error=str(e))
             if attempt < max(1, int(attempts)):
-                time.sleep(min(0.3 * attempt, 1.0))
+                time.sleep(min(1.5 * attempt, 5.0))
     return False
 def _sync_lot_capacity(lot_id, binding, subscription, occupied):
     b = _normalize_binding(binding)
     cap = _capacity_for_binding(b, subscription, occupied)
     if not b['enabled'] or b['manual_disabled']:
-        _auto_disabled.pop(str(lot_id), None)
+        with _state_lock:
+            _auto_disabled.pop(str(lot_id), None)
         _set_funpay_lot_fields(lot_id, False, 0)
         return cap
     if cap.get('reason') == 'no_free_slots' and (not bool(cfg_get('auto_deactivate_on_slots'))):
         return cap
     qty = int(cap.get('sellable_qty', 0) or 0)
     active = qty > 0
-    if active:
-        _auto_disabled.pop(str(lot_id), None)
-    else:
-        _auto_disabled[str(lot_id)] = time.time()
+    with _state_lock:
+        if active:
+            _auto_disabled.pop(str(lot_id), None)
+        else:
+            _auto_disabled[str(lot_id)] = time.time()
     _set_funpay_lot_fields(lot_id, active, qty)
     return cap
 def _capacity_check_once(subscription=None, accounts=None):
@@ -1482,9 +1699,12 @@ def _capacity_check_once(subscription=None, accounts=None):
             results[lot_id] = _sync_lot_capacity(lot_id, binding, subscription, occupied)
         except Exception as e:
             _log_event('lot_capacity_sync_error', level=logging.WARNING, lot_id=lot_id, error=str(e))
-    if before != set(_auto_disabled):
+    with _state_lock:
+        after = set(_auto_disabled)
+        auto_disabled_snapshot = dict(_auto_disabled)
+    if before != after:
         try:
-            _atomic_json(AUTO_DISABLED_FILE, dict(_auto_disabled))
+            _atomic_json(AUTO_DISABLED_FILE, auto_disabled_snapshot)
         except Exception:
             pass
     return results
@@ -1884,13 +2104,17 @@ def handle_new_order(cardinal_obj, event, *args):
     hours = _service_duration_hours(binding, quantity)
     buyer = _order_buyer_name(order, event)
     chat_id = _order_chat_id(order, event)
-    safe, capacity, sub, accounts = _order_capacity_check(binding, quantity)
-    queued = bool(capacity.get('queue')) if safe else False
-    service = {'order_id': oid, 'lot_id': lot_id, 'lot_name': str(binding.get('lot_name') or ''), 'quantity': quantity, 'duration_hours': hours, 'max_games': int(binding.get('max_games') or 1), 'hidden': bool(binding.get('hidden', False)), 'game_policy': str(binding.get('game_policy') or 'buyer'), 'fixed_games': list(binding.get('fixed_games') or []), 'buyer': buyer, 'chat_id': chat_id, 'step': 'queued' if queued else 'await_login' if safe else 'blocked_capacity', 'steam_login': '', 'api_account_id': None, 'games': [], 'created_at': time.time(), 'queued_at': time.time() if queued else None, 'started_at': None, 'ends_at': None, 'completed_at': None, 'error': '' if safe else str(capacity.get('reason') or 'capacity'), 'backend': _backend_mode()}
-    with _state_lock:
-        if oid in _services:
-            return
-        _services[oid] = service
+    with _order_capacity_lock:
+        with _state_lock:
+            if oid in _services:
+                return
+        safe, capacity, sub, accounts = _order_capacity_check(binding, quantity)
+        queued = bool(capacity.get('queue')) if safe else False
+        service = {'order_id': oid, 'lot_id': lot_id, 'lot_name': str(binding.get('lot_name') or ''), 'quantity': quantity, 'duration_hours': hours, 'max_games': int(binding.get('max_games') or 1), 'hidden': bool(binding.get('hidden', False)), 'game_policy': str(binding.get('game_policy') or 'buyer'), 'fixed_games': list(binding.get('fixed_games') or []), 'buyer': buyer, 'chat_id': chat_id, 'step': 'queued' if queued else 'await_login' if safe else 'blocked_capacity', 'steam_login': '', 'api_account_id': None, 'games': [], 'created_at': time.time(), 'queued_at': time.time() if queued else None, 'started_at': None, 'ends_at': None, 'completed_at': None, 'error': '' if safe else str(capacity.get('reason') or 'capacity'), 'backend': _backend_mode()}
+        with _state_lock:
+            if oid in _services:
+                return
+            _services[oid] = service
     _save_runtime_state()
     _log_event('farm_order_received', order_id=oid, lot_id=lot_id, quantity=quantity, hours=hours, buyer=buyer or 'unknown', queued=queued)
     if queued:
@@ -2220,6 +2444,8 @@ def _subscription_notifications(subscription, accounts, now_ts=None):
     if changed:
         _save_runtime_state()
 def _background_loop():
+    if _stop_event.wait(20.0):
+        return
     while not _stop_event.is_set():
         try:
             snap = _api_snapshot(force=True)
@@ -2306,7 +2532,7 @@ def _menu_local(chat_id, message_id=None, live=True):
     lines = [
         '🖥 <b>Local backend</b>', '',
         f"Используется: <b>{'✅ да' if _backend_mode() == 'local' else 'нет'}</b>",
-        f"Node.js: <b>{'✅ готов' if status.get('node') else '⚪️ установится автоматически'}</b>",
+        f"Node.js: <b>{('✅ ' + html.escape(str(status.get('node_version') or 'готов')) + (' · portable' if status.get('node_bundled') else ' · system')) if status.get('node') else '⚪️ установится автоматически'}</b>",
         f"steam-user: <b>{'✅ установлен' if installed else '❌ не установлен'}</b>",
         f"Helper: <b>{'🟢 работает' if daemon_ok else ('🟠 не запущен' if installed else '⚪️ не готов')}</b>",
         f"Аккаунты: <b>{len(accounts)} / {int(cfg_get('local_max_accounts') or 3)}</b>",
@@ -2318,21 +2544,26 @@ def _menu_local(chat_id, message_id=None, live=True):
         [('📦 Установить / обновить', 'sfp_local_install'), ('🩺 Проверить', 'sfp_local_health')],
         [('👥 Лимит аккаунтов', 'sfp_local_accounts'), ('🎮 Лимит игр', 'sfp_local_games')],
         [('🔄 Перезапустить helper', 'sfp_local_restart')],
+        [('🗑 Portable Node.js', 'sfp_local_node_remove_ask'), ('🧹 steam-user/cache', 'sfp_local_deps_remove_ask')],
+        [('♻️ Полная переустановка', 'sfp_local_reset_ask')],
         [('◀️ Назад', 'sfp_backend')],
     ]
     text = '\n'.join(lines)
     _tg_edit(chat_id, message_id, text, _make_kb(rows)) if message_id else _tg_send(chat_id, text, _make_kb(rows))
 def _local_install_result_keyboard():
     return [[('🔁 Повторить', 'sfp_local_install'), ('◀️ Назад', 'sfp_local')]]
-def _local_install_worker(chat_id, message_id=None):
+def _local_install_worker(chat_id, message_id=None, reset=False):
     try:
+        if reset:
+            _local_console('=== Полная переустановка Local backend ===')
+            _reset_local_backend()
         result = _install_local_runtime()
         _local_console('Запускаю helper после установки...')
         pong = _start_local_daemon(force=True)
         version = str(pong.get('version') or result.get('version') or 'OK')
         _tg_edit(
             chat_id, message_id,
-            f"✅ <b>Local backend установлен и запущен.</b>\n\nsteam-user: <code>{html.escape(version)}</code>\nПодробный вывод установки был показан в терминале Cardinal.",
+            f"✅ <b>{'Local backend полностью переустановлен и запущен.' if reset else 'Local backend установлен и запущен.'}</b>\n\nsteam-user: <code>{html.escape(version)}</code>\nПодробный вывод установки был показан в терминале Cardinal.",
             _make_kb(_local_install_result_keyboard()),
         )
     except Exception as e:
@@ -3147,6 +3378,56 @@ def _callback_router(call):
             _tg_send(chat_id, f'❌ {html.escape(_human_error(e))}')
         _menu_local(chat_id, message_id, live=False)
         return
+    if data in {'sfp_local_node_remove_ask', 'sfp_local_deps_remove_ask', 'sfp_local_reset_ask'}:
+        _ack(call)
+        active = _active_service_count()
+        if active:
+            _tg_edit(chat_id, message_id, f'⚠️ Очистка Local backend недоступна, пока есть активные заказы: <b>{active}</b>.', _make_kb([[('◀️ Назад', 'sfp_local')]]))
+            return
+        if data == 'sfp_local_node_remove_ask':
+            text = '⚠️ <b>Удалить portable Node.js?</b>\n\nБудет удалён только Node.js из каталога этого плагина. Системный Node.js из PATH не затрагивается.'
+            yes = ('🗑 Удалить', 'sfp_local_node_remove_yes')
+        elif data == 'sfp_local_deps_remove_ask':
+            text = '⚠️ <b>Удалить steam-user и npm cache?</b>\n\nHelper будет остановлен. Настройки плагина и portable Node.js останутся.'
+            yes = ('🧹 Очистить', 'sfp_local_deps_remove_yes')
+        else:
+            text = '⚠️ <b>Полностью переустановить Local backend?</b>\n\nPortable Node.js, steam-user и npm cache будут удалены, затем установлены заново.'
+            yes = ('♻️ Переустановить', 'sfp_local_reset_yes')
+        _tg_edit(chat_id, message_id, text, _make_kb([[yes, ('❌ Отмена', 'sfp_local')]]))
+        return
+    if data == 'sfp_local_node_remove_yes':
+        _ack(call, 'Удаляю…')
+        if _active_service_count():
+            _tg_send(chat_id, '⚠️ Появился активный заказ. Удаление отменено.')
+        else:
+            try:
+                result = _remove_local_node_runtime()
+                _tg_send(chat_id, '✅ Portable Node.js удалён.' if result.get('removed') else 'ℹ️ Portable Node.js плагина уже отсутствует. Системный Node.js не изменён.')
+            except Exception as e:
+                _tg_send(chat_id, f'❌ {html.escape(_human_error(e))}')
+        _menu_local(chat_id, message_id, live=False)
+        return
+    if data == 'sfp_local_deps_remove_yes':
+        _ack(call, 'Очищаю…')
+        if _active_service_count():
+            _tg_send(chat_id, '⚠️ Появился активный заказ. Очистка отменена.')
+        else:
+            try:
+                result = _remove_local_dependencies(remove_cache=True)
+                _tg_send(chat_id, '✅ steam-user и npm cache удалены.' if result.get('removed') else 'ℹ️ steam-user и npm cache уже отсутствуют.')
+            except Exception as e:
+                _tg_send(chat_id, f'❌ {html.escape(_human_error(e))}')
+        _menu_local(chat_id, message_id, live=False)
+        return
+    if data == 'sfp_local_reset_yes':
+        _ack(call, 'Переустанавливаю…')
+        if _active_service_count():
+            _tg_send(chat_id, '⚠️ Появился активный заказ. Переустановка отменена.')
+            _menu_local(chat_id, message_id, live=False)
+            return
+        _tg_edit(chat_id, message_id, '♻️ <b>Полная переустановка Local backend</b>\n\n⏳ Очищаю старый runtime и зависимости, затем заново устанавливаю Node.js/steam-user.\n\nПодробный прогресс смотрите в терминале Cardinal.', _make_kb([[('◀️ Назад', 'sfp_local')]]))
+        threading.Thread(target=_local_install_worker, args=(int(chat_id), message_id, True), daemon=True, name='steamfarm-local-reset').start()
+        return
     if data == 'sfp_local_health':
         _ack(call, 'Проверяю…')
         _health(chat_id, message_id, 'local')
@@ -3477,7 +3758,8 @@ def _callback_router(call):
             with _state_lock:
                 original.update({'enabled': False, 'manual_disabled': True})
                 _bindings[lot_id] = _normalize_binding(original)
-            _auto_disabled.pop(lot_id, None)
+            with _state_lock:
+                _auto_disabled.pop(lot_id, None)
             _save_runtime_state()
             _set_funpay_lot_fields(lot_id, False, 0)
             _menu_lot_detail(chat_id, message_id, lot_id)
